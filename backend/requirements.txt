@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+python-multipart
+langchain
+langchain-classic
+langchain-community
+langchain-google-genai
+chromadb
+google-generativeai
+pypdf
+python-docx
+lxml
+rank-bm25
+python-dotenv
+requests
+sentence-transformers
+numpy<2

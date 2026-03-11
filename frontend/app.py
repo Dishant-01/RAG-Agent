@@ -2,6 +2,7 @@ import os
 from typing import List, Tuple
 
 import requests
+from requests import exceptions as request_exceptions
 import streamlit as st
 
 st.set_page_config(page_title="Categorical RAG Chat", page_icon="📚", layout="wide")
@@ -11,10 +12,18 @@ DEFAULT_BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
 def upload_to_api(base_url: str, files) -> Tuple[bool, dict]:
     file_payload = [("files", (f.name, f.getvalue(), f.type or "application/octet-stream")) for f in files]
-    response = requests.post(f"{base_url}/upload", files=file_payload, timeout=180)
-    if response.ok:
-        return True, response.json()
-    return False, response.json() if response.headers.get("content-type", "").startswith("application/json") else {"error": response.text}
+    try:
+        response = requests.post(f"{base_url}/upload", files=file_payload, timeout=180)
+        if response.ok:
+            return True, response.json()
+        return (
+            False,
+            response.json()
+            if response.headers.get("content-type", "").startswith("application/json")
+            else {"error": response.text},
+        )
+    except request_exceptions.RequestException as exc:
+        return False, {"error": f"Backend not reachable: {exc}"}
 
 
 def query_api(
@@ -26,24 +35,50 @@ def query_api(
         "question": question,
         "enable_intelligence_synthesis": enable_intelligence_synthesis,
     }
-    response = requests.post(f"{base_url}/query", json=payload, timeout=180)
-    if response.ok:
-        return True, response.json()
-    return False, response.json() if response.headers.get("content-type", "").startswith("application/json") else {"error": response.text}
+    try:
+        response = requests.post(f"{base_url}/query", json=payload, timeout=180)
+        if response.ok:
+            return True, response.json()
+        return (
+            False,
+            response.json()
+            if response.headers.get("content-type", "").startswith("application/json")
+            else {"error": response.text},
+        )
+    except request_exceptions.RequestException as exc:
+        return False, {"error": f"Backend not reachable: {exc}"}
 
 
 def list_files_api(base_url: str) -> Tuple[bool, dict]:
-    response = requests.get(f"{base_url}/files", timeout=60)
-    if response.ok:
-        return True, response.json()
-    return False, response.json() if response.headers.get("content-type", "").startswith("application/json") else {"error": response.text}
+    try:
+        response = requests.get(f"{base_url}/files", timeout=60)
+        if response.ok:
+            return True, response.json()
+        return (
+            False,
+            response.json()
+            if response.headers.get("content-type", "").startswith("application/json")
+            else {"error": response.text},
+        )
+    except request_exceptions.RequestException as exc:
+        return False, {"error": f"Backend not reachable: {exc}"}
 
 
 def delete_file_api(base_url: str, source_name: str) -> Tuple[bool, dict]:
-    response = requests.delete(f"{base_url}/files", params={"source_name": source_name}, timeout=60)
-    if response.ok:
-        return True, response.json()
-    return False, response.json() if response.headers.get("content-type", "").startswith("application/json") else {"error": response.text}
+    try:
+        response = requests.delete(
+            f"{base_url}/files", params={"source_name": source_name}, timeout=60
+        )
+        if response.ok:
+            return True, response.json()
+        return (
+            False,
+            response.json()
+            if response.headers.get("content-type", "").startswith("application/json")
+            else {"error": response.text},
+        )
+    except request_exceptions.RequestException as exc:
+        return False, {"error": f"Backend not reachable: {exc}"}
 
 
 st.title("Categorical Assistant")
