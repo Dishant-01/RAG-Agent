@@ -189,11 +189,73 @@ class IntelligenceLayer:
             return self._parse_datetime(m.group(1))
         return None
 
-    def _infer_scope(self, rows: List[Dict[str, object]], question: str) -> tuple[List[Dict[str, object]], Dict[str, object]]:
+    def _normalize_scope_state(self, scope: Dict[str, object]) -> Dict[str, object]:
+        machines = [str(m).upper() for m in scope.get("machines", []) if str(m).strip()]
+        jobs = [str(j).upper() for j in scope.get("jobs", []) if str(j).strip()]
+        date = str(scope.get("date", "") or "").strip()
+        job_range = scope.get("job_range", []) or []
+        if isinstance(job_range, tuple):
+            job_range = list(job_range)
+        job_range = [int(x) for x in job_range[:2]] if len(job_range) >= 2 else []
+        return {
+            "machines": sorted(list(dict.fromkeys(machines))),
+            "jobs": sorted(list(dict.fromkeys(jobs))),
+            "date": date,
+            "job_range": job_range,
+        }
+
+    @staticmethod
+    def _scope_has_filters(scope_state: Dict[str, object]) -> bool:
+        return bool(
+            scope_state.get("machines")
+            or scope_state.get("jobs")
+            or scope_state.get("date")
+            or scope_state.get("job_range")
+        )
+
+    @staticmethod
+    def _should_reset_scope(question: str) -> bool:
+        q = (question or "").lower()
+        return any(
+            token in q
+            for token in [
+                "all machines",
+                "all jobs",
+                "overall",
+                "global",
+                "entire dataset",
+                "entire data",
+                "everything",
+                "all data",
+            ]
+        )
+
+    def _infer_scope(
+        self,
+        rows: List[Dict[str, object]],
+        question: str,
+        prior_scope: Dict[str, object] | None = None,
+    ) -> tuple[List[Dict[str, object]], Dict[str, object], Dict[str, object]]:
+        prior_scope = self._normalize_scope_state(prior_scope or {})
+
         machines = set(self._extract_machine_codes(question))
         jobs = set(self._extract_job_codes(question))
         q_date = self._extract_query_date(question)
         job_range = self._extract_job_range(question)
+
+        if self._should_reset_scope(question):
+            prior_scope = {}
+
+        if not machines and prior_scope.get("machines"):
+            machines = set(prior_scope.get("machines", []))
+        if not jobs and prior_scope.get("jobs"):
+            jobs = set(prior_scope.get("jobs", []))
+        if q_date is None and prior_scope.get("date"):
+            q_date = self._parse_datetime(str(prior_scope.get("date")))
+        if job_range is None and prior_scope.get("job_range"):
+            jr = prior_scope.get("job_range") or []
+            if len(jr) >= 2:
+                job_range = (int(jr[0]), int(jr[1]))
 
         scoped = rows
         if machines:
@@ -217,7 +279,8 @@ class IntelligenceLayer:
             "job_range": list(job_range) if job_range else [],
             "rows_after_filter": len(scoped),
         }
-        return scoped, scope
+        scope_state = self._normalize_scope_state(scope)
+        return scoped, scope, scope_state
 
     def _metric_values(self, rows: List[Dict[str, object]], metric_token: str) -> List[float]:
         vals: List[float] = []
@@ -376,12 +439,16 @@ class IntelligenceLayer:
             "failure_rates_by_machine": failure_rates,
         }
 
-    def answer(self, question: str) -> Tuple[str, List[Dict[str, str]]] | None:
+    def answer(
+        self,
+        question: str,
+        prior_scope: Dict[str, object] | None = None,
+    ) -> Tuple[str, List[Dict[str, str]], Dict[str, object]] | None:
         rows = self._collect_all_rows()
         if not rows:
             return None
 
-        scoped_rows, scope = self._infer_scope(rows, question)
+        scoped_rows, scope, scope_state = self._infer_scope(rows, question, prior_scope=prior_scope)
         # If filters are too strict and match nothing, keep global data visible.
         effective_rows = scoped_rows if scoped_rows else rows
         scope["used_global_fallback"] = bool(not scoped_rows and len(rows) > 0)
@@ -405,7 +472,7 @@ class IntelligenceLayer:
             {"source": str(r.get("source", "unknown")), "type": "pdf", "snippet": str(r.get("snippet", ""))}
             for r in effective_rows[:150]
         ]
-        return answer, sources
+        return answer, sources, scope_state
 
     def machine_row_counts(self) -> Dict[str, int]:
         rows = self._collect_all_rows()

@@ -74,6 +74,7 @@ class RAGEngine:
             chunk_overlap=150,
             separators=["\n\n", "\n", ". ", " ", ""],
         )
+        self._session_scopes: Dict[str, Dict[str, object]] = {}
 
     def _build_embeddings(self):
         if self.embedding_provider == "google":
@@ -243,6 +244,7 @@ SOURCE_SNIPPETS:
         question: str,
         k: int = 6,
         enable_intelligence_synthesis: bool | None = None,
+        session_id: str | None = None,
     ) -> Tuple[str, List[Dict[str, str]]]:
         synthesis_enabled = (
             self.enable_intelligence_synthesis
@@ -252,9 +254,15 @@ SOURCE_SNIPPETS:
         ql = question.lower()
         if any(token in ql for token in ["all jobs", "list jobs", "what are all the jobs", "which jobs"]):
             synthesis_enabled = False
-        structured = self.intelligence.answer(question)
+        prior_scope = self._session_scopes.get(session_id) if session_id else None
+        structured = self.intelligence.answer(question, prior_scope=prior_scope)
         if structured is not None:
-            answer, sources = structured
+            answer, sources, scope_state = structured
+            if session_id is not None:
+                if IntelligenceLayer._scope_has_filters(scope_state):
+                    self._session_scopes[session_id] = scope_state
+                else:
+                    self._session_scopes.pop(session_id, None)
             polished = self._synthesize_intelligence_answer(
                 question,
                 answer,

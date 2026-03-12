@@ -1,4 +1,5 @@
 import os
+import uuid
 from typing import List, Tuple
 
 import requests
@@ -29,11 +30,13 @@ def upload_to_api(base_url: str, files) -> Tuple[bool, dict]:
 def query_api(
     base_url: str,
     question: str,
+    session_id: str,
     enable_intelligence_synthesis: bool | None = None,
 ) -> Tuple[bool, dict]:
     payload = {
         "question": question,
         "enable_intelligence_synthesis": enable_intelligence_synthesis,
+        "session_id": session_id,
     }
     try:
         response = requests.post(f"{base_url}/query", json=payload, timeout=180)
@@ -150,6 +153,8 @@ with st.sidebar:
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -169,6 +174,7 @@ if question:
             ok, payload = query_api(
                 backend_url,
                 question,
+                session_id=st.session_state.session_id,
                 enable_intelligence_synthesis=enable_intelligence_synthesis,
             )
             if ok:

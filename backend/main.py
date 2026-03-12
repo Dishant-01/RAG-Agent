@@ -38,6 +38,7 @@ rag_engine = RAGEngine(
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=2)
     enable_intelligence_synthesis: bool | None = Field(default=None)
+    session_id: str | None = Field(default=None)
 
 
 @app.get("/health")
@@ -88,6 +89,7 @@ def query_documents(payload: QueryRequest):
         answer, sources = rag_engine.query(
             question=payload.question,
             enable_intelligence_synthesis=payload.enable_intelligence_synthesis,
+            session_id=payload.session_id,
         )
         return {"answer": answer, "sources": sources}
     except Exception as exc:
