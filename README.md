@@ -51,23 +51,4 @@ streamlit run app.py
 - `DELETE /files?source_name=<filename>`
 - `GET /stats`
 
-## Tests
-```powershell
-python -m unittest tests.test_intelligence_layer -v
-```
 
-## GitHub Push Ready Checklist
-1. Ensure `.env` is not committed (`.gitignore` already excludes it).
-2. Ensure `chroma_db/` is not committed (`.gitignore` already excludes it).
-3. Initialize git (if needed):
-```powershell
-git init
-git add .
-git commit -m "Initial production-ready Categorical RAG app"
-```
-4. Add remote and push:
-```powershell
-git remote add origin <your-repo-url>
-git branch -M main
-git push -u origin main
-```
