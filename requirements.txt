@@ -5,9 +5,8 @@ streamlit
 langchain
 langchain-classic
 langchain-community
-langchain-google-genai
 chromadb
-google-generativeai
+google-genai
 pypdf
 unstructured
 python-docx

@@ -1,14 +1,10 @@
 import os
 import socket
 import uuid
+import logging
 from typing import Dict, List, Tuple
 
 try:
-    try:
-        from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-    except ImportError:
-        from langchain.chains.combine_documents import create_stuff_documents_chain
-
     try:
         from langchain_classic.retrievers import EnsembleRetriever
     except ImportError:
@@ -23,8 +19,8 @@ try:
     from langchain_community.retrievers import BM25Retriever
     from langchain_community.vectorstores import Chroma
     from langchain_core.documents import Document
-    from langchain_core.prompts import ChatPromptTemplate
-    from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+    from langchain_core.embeddings import Embeddings
+    from google import genai
     from document_parsers import DocumentParser
     from intelligence_layer import IntelligenceLayer
 except ModuleNotFoundError as exc:
@@ -35,19 +31,54 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 
+class GeminiGenAIEmbeddings(Embeddings):
+    """LangChain-compatible embeddings wrapper using google-genai API key auth."""
+
+    def __init__(self, client: genai.Client, model: str) -> None:
+        self.client = client
+        self.model = model
+
+    @staticmethod
+    def _extract_vectors(response) -> List[List[float]]:
+        if hasattr(response, "embeddings") and response.embeddings:
+            vectors = []
+            for emb in response.embeddings:
+                values = getattr(emb, "values", None)
+                if values is not None:
+                    vectors.append([float(v) for v in values])
+            if vectors:
+                return vectors
+        if hasattr(response, "embedding") and response.embedding:
+            values = getattr(response.embedding, "values", None)
+            if values is not None:
+                return [[float(v) for v in values]]
+        raise ValueError("Gemini embedding response did not contain vector values.")
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        response = self.client.models.embed_content(
+            model=self.model,
+            contents=texts,
+        )
+        return self._extract_vectors(response)
+
+    def embed_query(self, text: str) -> List[float]:
+        vectors = self.embed_documents([text])
+        return vectors[0] if vectors else []
+
+
 class RAGEngine:
     def __init__(
         self,
         persist_directory: str = "chroma_db",
         collection_name: str = "categorical_rag",
-        google_api_key: str | None = None,
         embedding_model: str | None = None,
         embedding_provider: str | None = None,
         local_embedding_model: str | None = None,
         llm_model: str | None = None,
+        gemini_api_key: str | None = None,
     ) -> None:
-        raw_key = google_api_key or os.getenv("GOOGLE_API_KEY", "YOUR_GOOGLE_API_KEY")
-        self.google_api_key = (raw_key or "").strip().strip("'").strip('"')
         self.persist_directory = persist_directory
         self.collection_name = collection_name
         self.embedding_provider = (embedding_provider or os.getenv("EMBEDDING_PROVIDER", "local")).strip().lower()
@@ -57,10 +88,16 @@ class RAGEngine:
             "sentence-transformers/all-MiniLM-L6-v2",
         )
         self.llm_model = llm_model or os.getenv("GOOGLE_LLM_MODEL", "gemini-2.5-flash")
+        self.gemini_api_key = (
+            gemini_api_key or os.getenv("GEMINI_API_KEY", "")
+        ).strip().strip("'").strip('"')
         self.enable_intelligence_synthesis = (
             os.getenv("ENABLE_INTELLIGENCE_SYNTHESIS", "true").strip().lower() == "true"
         )
+        self.llm_strict_errors = os.getenv("LLM_STRICT_ERRORS", "false").strip().lower() == "true"
+        self.logger = logging.getLogger(__name__)
 
+        self._genai_client: genai.Client | None = None
         self.embeddings = self._build_embeddings()
         self.vectorstore = Chroma(
             collection_name=self.collection_name,
@@ -78,9 +115,10 @@ class RAGEngine:
 
     def _build_embeddings(self):
         if self.embedding_provider == "google":
-            return GoogleGenerativeAIEmbeddings(
+            client = self._get_genai_client()
+            return GeminiGenAIEmbeddings(
+                client=client,
                 model=self.embedding_model,
-                google_api_key=self.google_api_key,
             )
         if self.embedding_provider == "local":
             return HuggingFaceEmbeddings(
@@ -91,8 +129,43 @@ class RAGEngine:
         raise ValueError("Invalid EMBEDDING_PROVIDER. Use 'local' or 'google'.")
 
     def _ensure_api_key(self) -> None:
-        if not self.google_api_key or self.google_api_key == "YOUR_GOOGLE_API_KEY":
-            raise ValueError("GOOGLE_API_KEY is not set. Replace placeholder with a valid API key.")
+        if not self.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY is not set.")
+
+    def _get_genai_client(self) -> genai.Client:
+        if self._genai_client is not None:
+            return self._genai_client
+        self._ensure_api_key()
+        self._genai_client = genai.Client(api_key=self.gemini_api_key)
+        return self._genai_client
+
+    @staticmethod
+    def _extract_generated_text(response) -> str:
+        text = getattr(response, "text", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None) if content is not None else None
+            if not parts:
+                continue
+            chunks = [getattr(part, "text", "") for part in parts if getattr(part, "text", "")]
+            if chunks:
+                return "\n".join(chunks).strip()
+        return ""
+
+    def _generate_text(self, prompt: str, temperature: float = 0.2) -> str:
+        client = self._get_genai_client()
+        response = client.models.generate_content(
+            model=self.llm_model,
+            contents=prompt,
+            config={"temperature": temperature},
+        )
+        text = self._extract_generated_text(response)
+        if not text:
+            raise ValueError("Gemini returned an empty response.")
+        return text
 
     def ingest_file(self, file_path: str, source_name: str) -> int:
         docs = self.parser.load_documents(file_path, source_name)
@@ -134,36 +207,34 @@ class RAGEngine:
         vector = self.vectorstore.as_retriever(search_kwargs={"k": k})
         return EnsembleRetriever(retrievers=[bm25, vector], weights=[0.45, 0.55])
 
-    def _build_qa_chain(self):
-        self._ensure_api_key()
-        llm = ChatGoogleGenerativeAI(
-            model=self.llm_model,
-            google_api_key=self.google_api_key,
-            temperature=0.2,
+    def _build_retrieval_prompt(self, question: str, retrieved_docs: List[Document]) -> str:
+        context = "\n\n".join(
+            f"[Source: {doc.metadata.get('source', 'unknown')}]\n{doc.page_content[:2200]}"
+            for doc in retrieved_docs[:8]
         )
-        prompt = ChatPromptTemplate.from_template(
-            """
+        return f"""
 You are a production RAG assistant.
-Use only the retrieved context to answer.
-
-When answering:
-1. Separate categorical facts (exact labels, categories, codes, tags, enumerations) from descriptive context.
-2. Prefer exact categorical values when there is a mismatch.
-3. If context is insufficient, say what is missing.
+Use only the retrieved context to answer. Do not invent facts.
 
 Context:
-{context}
+{context or "No context provided."}
 
 Question:
-{input}
+{question}
 
 Answer with:
-- Categorical Facts:
-- Descriptive Context:
-- Final Answer:
+Direct Answer:
+- concise answer
+
+Key Evidence:
+- 3-6 concrete values/facts from context
+
+Recommendations:
+- 2-5 practical actions tied to evidence
+
+Assumptions/Limitations:
+- explicit caveats and missing-data notes
 """
-        )
-        return create_stuff_documents_chain(llm=llm, prompt=prompt)
 
     def _synthesize_intelligence_answer(
         self,
@@ -176,12 +247,6 @@ Answer with:
             return raw_answer
 
         try:
-            self._ensure_api_key()
-            llm = ChatGoogleGenerativeAI(
-                model=self.llm_model,
-                google_api_key=self.google_api_key,
-                temperature=0.1,
-            )
             source_lines = []
             for idx, src in enumerate(sources[:12], start=1):
                 source_lines.append(
@@ -189,19 +254,19 @@ Answer with:
                 )
             source_text = "\n".join(source_lines) if source_lines else "No source snippets provided."
 
-            prompt = ChatPromptTemplate.from_template(
-                """
-You are an industrial operations intelligence analyst.
+            prompt = f"""
+You are a data intelligence analyst.
 Transform the raw analytics output into a clear, practical response for end users.
 
 Hard rules:
 1. Use only facts present in RAW_ANALYTICS and SOURCE_SNIPPETS.
-2. Do not invent metrics, dates, machines, jobs, statuses, or calculations.
+2. Do not invent metrics, dimensions, dates, categories, statuses, or calculations.
 3. If data is missing, state it explicitly and recommend what data should be captured.
 4. Recommendations must be directly tied to evidence.
-5. If RAW_ANALYTICS includes `ANALYTICS_CONTEXT_JSON`, parse it and prioritize `scoped_summary` for direct answers.
-6. Use `global_summary` for benchmark/comparison context.
-7. When user asks a count/total, prefer exact numeric fields from the JSON.
+5. If RAW_ANALYTICS includes `ANALYTICS_CONTEXT_JSON`, parse it and use `scoped_summary`, `global_summary`, `universal_analytics`, and `dynamic_metrics` as the primary evidence.
+6. Prefer computed metrics over textual snippets whenever both exist.
+7. For counts/rates/trends/comparisons, cite exact values and their coverage (rows/records used).
+8. For "entire dataset"/"overall" questions, prioritize `universal_analytics.numeric_field_coverage`, `high_coverage_numeric_fields`, and `dataset_wide_composites` over sparse low-coverage fields.
 
 Output format (exact headings):
 Direct Answer:
@@ -225,18 +290,63 @@ RAW_ANALYTICS:
 SOURCE_SNIPPETS:
 {source_text}
 """
-            )
-            messages = prompt.format_messages(
-                question=question,
-                raw_answer=raw_answer,
-                source_text=source_text,
-            )
-            response = llm.invoke(messages)
-            text = getattr(response, "content", None)
-            if isinstance(text, str) and text.strip():
-                return text.strip()
+            return self._generate_text(prompt, temperature=0.1)
+        except Exception as exc:
+            self.logger.exception("Intelligence synthesis failed: %s", exc)
+            if self.llm_strict_errors:
+                raise
             return raw_answer
-        except Exception:
+
+    def _synthesize_retrieval_answer(
+        self,
+        question: str,
+        raw_answer: str,
+        sources: List[Dict[str, str]],
+        enable_synthesis: bool,
+    ) -> str:
+        if not enable_synthesis:
+            return raw_answer
+
+        try:
+            source_lines = []
+            for idx, src in enumerate(sources[:12], start=1):
+                source_lines.append(
+                    f"{idx}. {src.get('source', 'unknown')} | {src.get('type', 'unknown')} | {src.get('snippet', '')}"
+                )
+            source_text = "\n".join(source_lines) if source_lines else "No source snippets provided."
+
+            prompt = f"""
+You are a data intelligence analyst.
+Reformat RAW_ANSWER into a strict user-facing structure. Use only RAW_ANSWER and SOURCE_SNIPPETS.
+Do not invent facts, numbers, dates, or categories.
+
+Output format (exact headings):
+Direct Answer:
+- concise answer to user's question
+
+Key Evidence:
+- 3-6 bullets with concrete values from RAW_ANSWER or SOURCE_SNIPPETS
+
+Recommendations:
+- 2-5 practical actions tied to evidence
+
+Assumptions/Limitations:
+- explicit caveats and missing-data notes
+
+USER_QUESTION:
+{question}
+
+RAW_ANSWER:
+{raw_answer}
+
+SOURCE_SNIPPETS:
+{source_text}
+"""
+            return self._generate_text(prompt, temperature=0.1)
+        except Exception as exc:
+            self.logger.exception("Retrieval synthesis failed: %s", exc)
+            if self.llm_strict_errors:
+                raise
             return raw_answer
 
     def query(
@@ -251,9 +361,6 @@ SOURCE_SNIPPETS:
             if enable_intelligence_synthesis is None
             else bool(enable_intelligence_synthesis)
         )
-        ql = question.lower()
-        if any(token in ql for token in ["all jobs", "list jobs", "what are all the jobs", "which jobs"]):
-            synthesis_enabled = False
         prior_scope = self._session_scopes.get(session_id) if session_id else None
         structured = self.intelligence.answer(question, prior_scope=prior_scope)
         if structured is not None:
@@ -272,10 +379,10 @@ SOURCE_SNIPPETS:
             return polished, sources
 
         retriever = self._build_hybrid_retriever(k=k)
-        chain = self._build_qa_chain()
         retrieved_docs = retriever.invoke(question)
         try:
-            answer = chain.invoke({"input": question, "context": retrieved_docs})
+            prompt = self._build_retrieval_prompt(question, retrieved_docs)
+            answer = self._generate_text(prompt, temperature=0.2)
         except socket.gaierror as exc:
             raise ConnectionError("Cannot reach Gemini endpoint (DNS/network issue).") from exc
         except OSError as exc:
@@ -292,7 +399,13 @@ SOURCE_SNIPPETS:
                     "snippet": doc.page_content[:220].replace("\n", " "),
                 }
             )
-        return answer, sources
+        polished = self._synthesize_retrieval_answer(
+            question=question,
+            raw_answer=answer,
+            sources=sources,
+            enable_synthesis=synthesis_enabled,
+        )
+        return polished, sources
 
     def machine_row_counts(self) -> Dict[str, int]:
         return self.intelligence.machine_row_counts()
@@ -336,3 +449,6 @@ SOURCE_SNIPPETS:
         deleted_chunks = int(existing["chunks"])
         self.vectorstore.delete(where={"source": source_name})
         return deleted_chunks
+
+    def schema_summary(self) -> Dict[str, object]:
+        return self.intelligence.schema_summary()

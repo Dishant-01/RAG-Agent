@@ -28,7 +28,7 @@ copy .env.example .env
 ```
 
 Set required values in `.env`:
-- `GOOGLE_API_KEY` (required for LLM synthesis/fallback)
+- `GEMINI_API_KEY` (required)
 - `EMBEDDING_PROVIDER=local` (recommended)
 - `LOCAL_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2`
 

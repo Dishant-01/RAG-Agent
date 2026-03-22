@@ -25,13 +25,13 @@ app.add_middleware(
 rag_engine = RAGEngine(
     persist_directory=os.getenv("CHROMA_PERSIST_DIR", "chroma_db"),
     collection_name=os.getenv("CHROMA_COLLECTION", "categorical_rag"),
-    google_api_key=os.getenv("GOOGLE_API_KEY", "YOUR_GOOGLE_API_KEY"),
     embedding_model=os.getenv("GOOGLE_EMBEDDING_MODEL", "models/gemini-embedding-001"),
     embedding_provider=os.getenv("EMBEDDING_PROVIDER", "local"),
     local_embedding_model=os.getenv(
         "LOCAL_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
     ),
     llm_model=os.getenv("GOOGLE_LLM_MODEL", "gemini-2.5-flash"),
+    gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
 )
 
 
@@ -114,6 +114,14 @@ def list_files():
     try:
         files = rag_engine.list_indexed_sources()
         return {"files": files, "count": len(files)}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/schema")
+def schema_summary():
+    try:
+        return rag_engine.schema_summary()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

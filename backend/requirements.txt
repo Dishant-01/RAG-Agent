@@ -4,10 +4,10 @@ python-multipart
 langchain
 langchain-classic
 langchain-community
-langchain-google-genai
 chromadb
-google-generativeai
+google-genai
 pypdf
+pdfplumber
 python-docx
 lxml
 rank-bm25
