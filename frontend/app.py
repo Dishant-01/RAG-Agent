@@ -14,7 +14,7 @@ DEFAULT_BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 def upload_to_api(base_url: str, files) -> Tuple[bool, dict]:
     file_payload = [("files", (f.name, f.getvalue(), f.type or "application/octet-stream")) for f in files]
     try:
-        response = requests.post(f"{base_url}/upload", files=file_payload, timeout=180)
+        response = requests.post(f"{base_url}/upload", files=file_payload, timeout=600)
         if response.ok:
             return True, response.json()
         return (
@@ -39,7 +39,7 @@ def query_api(
         "session_id": session_id,
     }
     try:
-        response = requests.post(f"{base_url}/query", json=payload, timeout=180)
+        response = requests.post(f"{base_url}/query", json=payload, timeout=600)
         if response.ok:
             return True, response.json()
         return (
