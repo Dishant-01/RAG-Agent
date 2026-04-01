@@ -258,9 +258,8 @@ class IntelligenceLayer:
             compact = self._field_name_compact(name)
             if meta["numeric_ratio"] >= 0.6:
                 numeric_fields.append(name)
-                unique_ratio = meta["unique_count"] / max(meta["count"], 1)
                 is_identifier = any(t in tokens for t in ["id", "code", "number", "num"])
-                if unique_ratio < 0.95 and not is_identifier:
+                if not is_identifier:
                     measure_fields.append(name)
             has_datetime_hint = any(t in tokens for t in ["date", "time", "timestamp", "datetime"]) or any(
                 kw in compact for kw in ["date", "time", "timestamp", "datetime"]
@@ -418,6 +417,24 @@ class IntelligenceLayer:
             for token in ["overall", "global", "all data", "entire dataset", "everything", "no filter"]
         )
 
+    @staticmethod
+    def _should_reuse_prior_scope(question: str) -> bool:
+        q = (question or "").lower()
+        follow_up_markers = [
+            "same",
+            "those",
+            "them",
+            "that one",
+            "that machine",
+            "that group",
+            "previous",
+            "earlier",
+            "again",
+            "for it",
+            "for those",
+        ]
+        return any(marker in q for marker in follow_up_markers)
+
     def _infer_scope(
         self,
         rows: List[Dict[str, object]],
@@ -426,6 +443,8 @@ class IntelligenceLayer:
         prior_scope: Dict[str, object] | None = None,
     ) -> tuple[List[Dict[str, object]], Dict[str, object], Dict[str, object]]:
         prior = self._normalize_scope_state(prior_scope or {})
+        if prior and not self._should_reuse_prior_scope(question):
+            prior = {"filters": {}, "date": ""}
         if self._should_reset_scope(question):
             prior = {"filters": {}, "date": ""}
 
@@ -592,7 +611,7 @@ class IntelligenceLayer:
             "variance", "standard", "deviation", "across", "all", "there", "are", "is",
             "in", "on", "of", "the", "and", "or", "for", "to", "with", "than", "their",
             "its", "does", "do", "did", "from", "during", "week", "weeks", "month", "day",
-            "hour", "jobs", "students", "dataset", "records", "entries",
+            "hour", "dataset", "records", "entries",
         }
         tokens = [t for t in raw_tokens if len(t) >= 3 and t not in stop]
         out: List[str] = []
@@ -600,6 +619,77 @@ class IntelligenceLayer:
             if t and t not in out:
                 out.append(t)
         return out[:8]
+
+    @staticmethod
+    def _token_match_score(a_tokens: List[str], b_tokens: List[str]) -> float:
+        if not a_tokens or not b_tokens:
+            return 0.0
+        bset = set(b_tokens)
+        exact = sum(1 for t in a_tokens if t in bset)
+        partial = sum(
+            1
+            for t in a_tokens
+            for b in bset
+            if t != b and len(t) >= 4 and (t in b or b in t)
+        )
+        return float(exact) + (0.25 * float(partial))
+
+    def _field_question_score(
+        self,
+        field_name: str,
+        question_tokens: List[str],
+        field_meta: Dict[str, object] | None = None,
+    ) -> float:
+        if not question_tokens:
+            return 0.0
+        name_tokens = self._field_name_tokens(field_name)
+        score = self._token_match_score(name_tokens, question_tokens)
+        examples = (field_meta or {}).get("examples", []) if field_meta else []
+        if examples:
+            ex_text = " ".join(str(x).lower() for x in examples)
+            example_hits = sum(1 for q in question_tokens if q and q in ex_text)
+            score += 0.15 * float(example_hits)
+        if re.fullmatch(r"col_\d+", field_name or ""):
+            score -= 0.2
+        return score
+
+    def _rank_numeric_fields_by_question(
+        self,
+        question: str,
+        schema: Dict[str, object],
+    ) -> List[str]:
+        numeric_fields = schema.get("numeric_fields", []) or []
+        field_meta = schema.get("fields", {}) or {}
+        q_tokens = self._tokenize(question)
+        ranked: List[Tuple[str, float]] = []
+        for field in numeric_fields:
+            meta = field_meta.get(field, {}) or {}
+            coverage = float(meta.get("count", 0))
+            coverage_hint = min(coverage / 1000.0, 1.0)
+            score = self._field_question_score(field, q_tokens, meta) + coverage_hint
+            if not self._field_name_compact(field).isdigit():
+                score += 0.1
+            ranked.append((field, score))
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        return [f for f, _ in ranked]
+
+    def _rank_dimension_fields_by_question(
+        self,
+        question: str,
+        schema: Dict[str, object],
+    ) -> List[str]:
+        dim_fields = schema.get("dimension_fields", []) or []
+        field_meta = schema.get("fields", {}) or {}
+        q_tokens = self._tokenize(question)
+        ranked: List[Tuple[str, float]] = []
+        for field in dim_fields:
+            meta = field_meta.get(field, {}) or {}
+            score = self._field_question_score(field, q_tokens, meta)
+            if not re.fullmatch(r"col_\d+", field or ""):
+                score += 0.1
+            ranked.append((field, score))
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        return [f for f, _ in ranked]
 
     def _compute_question_label_distribution(
         self,
@@ -699,16 +789,11 @@ class IntelligenceLayer:
         if len(labels) < 2 or not selected_fields:
             return {}
 
-        numeric_fields = schema.get("numeric_fields", []) or []
-        preferred_measures: List[str] = []
-        for field in numeric_fields:
-            tokens = self._field_name_tokens(field)
-            if any(t in tokens for t in ["score", "sales", "revenue", "amount", "pickup", "trip", "consumption", "duration"]):
-                preferred_measures.append(field)
-        for field in numeric_fields:
-            if field not in preferred_measures and not self._field_name_compact(field).isdigit():
-                preferred_measures.append(field)
-        measures = preferred_measures[:6]
+        measure_hint = " ".join(str(x) for x in (label_distribution.get("labels") or []))
+        ranked_numeric = self._rank_numeric_fields_by_question(measure_hint, schema)
+        measures = [f for f in ranked_numeric if not self._field_name_compact(f).isdigit()][:6]
+        if not measures:
+            measures = ranked_numeric[:6]
         if not measures:
             return {}
 
@@ -803,21 +888,25 @@ class IntelligenceLayer:
     def _pick_measure_field(self, question: str, schema: Dict[str, object]) -> Tuple[str, str]:
         measure_fields = schema.get("measure_fields", []) or []
         numeric_fields = schema.get("numeric_fields", []) or []
+        field_meta = schema.get("fields", {}) or {}
+        q_tokens = self._tokenize(question)
         if len(measure_fields) == 1:
             return measure_fields[0], "single_measure"
-        preferred: List[str] = []
-        for field in measure_fields + numeric_fields:
-            tokens = self._field_name_tokens(field)
-            compact = self._field_name_compact(field)
-            if compact.isdigit():
-                continue
-            if any(t in tokens for t in ["score", "sales", "revenue", "amount", "pickup", "trip", "consumption", "duration"]):
-                preferred.append(field)
-        if preferred:
-            return preferred[0], "semantic_preference"
+        ranked_numeric = self._rank_numeric_fields_by_question(question, schema)
+        candidate_pool = [f for f in ranked_numeric if f in set(measure_fields + numeric_fields)]
+        if candidate_pool:
+            best = candidate_pool[0]
+            best_meta = field_meta.get(best, {}) or {}
+            best_score = self._field_question_score(best, q_tokens, best_meta)
+            if q_tokens and best_score < 0.35:
+                return "", "low_confidence"
+            for field in candidate_pool:
+                if not self._field_name_compact(field).isdigit():
+                    return field, "question_relevance"
+            return candidate_pool[0], "question_relevance"
         if measure_fields:
             return measure_fields[0], "schema_measure"
-        for field in numeric_fields:
+        for field in ranked_numeric:
             if not self._field_name_compact(field).isdigit():
                 return field, "numeric_fallback"
         return "", "none"
@@ -828,8 +917,17 @@ class IntelligenceLayer:
         schema: Dict[str, object],
     ) -> Tuple[str, str]:
         dimension_fields = schema.get("dimension_fields", []) or []
+        field_meta = schema.get("fields", {}) or {}
+        q_tokens = self._tokenize(question)
         if not dimension_fields:
             return "", "none"
+        ranked_dims = self._rank_dimension_fields_by_question(question, schema)
+        if ranked_dims:
+            best = ranked_dims[0]
+            best_score = self._field_question_score(best, q_tokens, field_meta.get(best, {}) or {})
+            if q_tokens and best_score < 0.35:
+                return "", "low_confidence"
+            return ranked_dims[0], "question_relevance"
         return dimension_fields[0], "schema_dimension"
 
     @staticmethod
@@ -933,12 +1031,21 @@ class IntelligenceLayer:
         actual_start = self._pick_first(candidates.get("actual_start", []))
         datetime_field = datetime_fields[0] if datetime_fields else ""
         primary_measure, primary_reason = self._pick_measure_field(question, schema)
+        ranked_numeric = self._rank_numeric_fields_by_question(question, schema)
         selected_measures = [m for m in [primary_measure] if m]
-        for m in measure_fields:
-            if m not in selected_measures:
+        for m in ranked_numeric:
+            if m not in selected_measures and not self._field_name_compact(m).isdigit():
                 selected_measures.append(m)
             if len(selected_measures) >= 3:
                 break
+        if not selected_measures:
+            for m in measure_fields:
+                if m not in selected_measures:
+                    selected_measures.append(m)
+                if len(selected_measures) >= 3:
+                    break
+        ranked_dims = self._rank_dimension_fields_by_question(question, schema)
+        selected_group_fields = ranked_dims[:3] if ranked_dims else dimension_fields[:3]
 
         if scheduled_start and actual_start:
             data = {
@@ -987,7 +1094,7 @@ class IntelligenceLayer:
             )
 
         # Precompute grouped summaries for top dimensions and measures, independent of query keywords.
-        for group_field in dimension_fields[:3]:
+        for group_field in selected_group_fields:
             for measure in selected_measures[:2]:
                 grouped = self._compute_grouped_math(rows, group_field, measure)
                 group_stats = grouped.get("groups", {})
